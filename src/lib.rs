@@ -24,7 +24,10 @@ use windows::{
             BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS,
             CRYPT_KEY_FLAGS,
         },
-        System::LibraryLoader::{GetProcAddress, LoadLibraryW},
+        System::{
+            LibraryLoader::{GetProcAddress, LoadLibraryW},
+            Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE},
+        },
     },
 };
 
@@ -36,6 +39,7 @@ struct Settings {
     auto_key_fetch: bool,
     addresses: Vec<AddrReplace>,
     classic_wine_fix: bool,
+    md5_search: Vec<u8>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -46,6 +50,11 @@ impl Default for Settings {
             auto_key_fetch: false,
             addresses: vec![AddrReplace::default()],
             classic_wine_fix: false,
+            md5_search: vec![
+                0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
+                0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00,
+                0x00, 0x8b, 0x0d, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x8b, 0xda,
+            ],
         }
     }
 }
@@ -83,6 +92,7 @@ static HOOK_CRYPT_OPEN: RwLock<Option<GenericDetour<CryptImportKeyFn>>> = RwLock
 static HOOK_CRYPT_EXPORT: RwLock<Option<GenericDetour<BCryptExportKey>>> = RwLock::new(None);
 static HOOK_GETADDRINFO: RwLock<Option<GenericDetour<GetaddrinfoFn>>> = RwLock::new(None);
 static HOOK_CONNECT: RwLock<Option<GenericDetour<ConnectFn>>> = RwLock::new(None);
+static HOOK_MD5: RwLock<Option<GenericDetour<MD5Fn>>> = RwLock::new(None);
 
 static PATH: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 static HANDLES: Mutex<Vec<HMODULE>> = Mutex::new(vec![]);
@@ -110,6 +120,8 @@ type CryptImportKeyFn =
 type GetaddrinfoFn = extern "system" fn(PCSTR, PCSTR, *const ADDRINFOA, *mut *mut ADDRINFOA) -> i32;
 
 type ConnectFn = extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32;
+
+type MD5Fn = extern "system" fn(u64, *const i8) -> *const i8;
 
 #[no_mangle]
 extern "system" fn init() {
@@ -167,8 +179,87 @@ fn run_init() -> Result<(), Box<dyn Error>> {
                 *HOOK_OPEN.write()? = Some(create_hook(orig_import, open_stub)?);
             }
         }
+        if !settings.md5_search.is_empty() {
+            if let Some(ptr) = find_md5(&settings.md5_search)? {
+                let orig_import: MD5Fn = mem::transmute(ptr);
+                *HOOK_MD5.write()? = Some(create_hook(orig_import, md5_stub)?);
+            }
+        }
     }
     Ok(())
+}
+
+fn find_md5(bytes: &[u8]) -> Result<Option<usize>, windows::core::Error> {
+    let pid = get_process("pso2.exe")?.unwrap();
+    let module = if check_ngs() {
+        return Ok(None);
+    } else {
+        "pso2.exe"
+    };
+    let Some(data) = get_module(pid, module)? else {
+        return Ok(None);
+    };
+    let data_ptr = data.as_ptr();
+    'outer: for i in 0..data.len() {
+        let new_ptr = unsafe { data_ptr.add(i) };
+        for (ii, byte) in bytes.iter().enumerate() {
+            if *byte != 0xFF && data[i + ii] != *byte {
+                continue 'outer;
+            }
+        }
+        process_manip::print_msgbox("yes", " a");
+        let mut old_flags = PAGE_PROTECTION_FLAGS::default();
+        unsafe {
+            let _ = VirtualProtect(data_ptr.add(0x34) as _, 8, PAGE_READWRITE, &mut old_flags);
+        }
+        data[0x34] = 0x58;
+        data[0x35] = 0xc0;
+        data[0x36] = 0x62;
+        data[0x37] = 0x82;
+        data[0x38] = 0xab;
+        data[0x39] = 0x26;
+        data[0x3a] = 0xa0;
+        data[0x3b] = 0xb1;
+        unsafe {
+            let _ = VirtualProtect(data_ptr.add(0x34) as _, 8, old_flags, std::ptr::null_mut());
+        }
+        process_manip::print_msgbox("yes", " a");
+        return Ok(Some(new_ptr as usize));
+    }
+    Ok(None)
+}
+
+extern "system" fn md5_stub(a: u64, input: *const i8) -> *const i8 {
+    let hook_lock = HOOK_MD5.read().unwrap_window();
+    let output = hook_lock.as_ref().unwrap().call(a, input);
+    let filename = unsafe { std::ffi::CStr::from_ptr(input) }.to_str().unwrap();
+    let hash = unsafe { std::ffi::CStr::from_ptr(output) }
+        .to_str()
+        .unwrap();
+    fn move_file(base_dir: &str, filename: &str, hash: &str) {
+        let mut orig_filename = std::path::PathBuf::from(base_dir);
+        let mut new_filename = orig_filename.clone();
+        orig_filename.push(hash);
+        new_filename.push(filename);
+        let mut file_path = new_filename.clone();
+        file_path.pop();
+        if orig_filename.is_file() {
+            std::fs::create_dir_all(&file_path).unwrap();
+            std::fs::rename(&orig_filename, &new_filename).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open("hashed.txt")
+                .unwrap()
+                .write_all(format!("{hash} - {filename}\n").as_bytes())
+                .unwrap();
+        }
+    }
+    move_file("data/win32", filename, hash);
+    move_file("data/win32_na", filename, hash);
+    drop(hook_lock);
+    // output
+    input
 }
 
 fn read_settings() -> Settings {
@@ -439,11 +530,11 @@ fn get_process(process_name: &str) -> Result<Option<u32>, windows::core::Error> 
     Ok(None)
 }
 
-fn get_module(pid: u32, module_name: &str) -> Result<Option<&[u8]>, windows::core::Error> {
+fn get_module(pid: u32, module_name: &str) -> Result<Option<&mut [u8]>, windows::core::Error> {
     let modules = ModuleSnapshot::new(pid)?;
     for module in modules {
         if module.module_name == module_name {
-            return Ok(Some(unsafe { module.get_memory() }));
+            return Ok(Some(unsafe { module.get_memory_mut() }));
         }
     }
     Ok(None)

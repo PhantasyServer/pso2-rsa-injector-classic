@@ -205,6 +205,9 @@ impl ModuleEntry {
     pub unsafe fn get_memory(&self) -> &'static [u8] {
         slice::from_raw_parts(self.module_addr, self.module_size as usize)
     }
+    pub unsafe fn get_memory_mut(&self) -> &'static mut [u8] {
+        slice::from_raw_parts_mut(self.module_addr, self.module_size as usize)
+    }
 }
 
 pub fn print_msgbox(msg: &str, header: &str) {
