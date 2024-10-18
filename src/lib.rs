@@ -26,7 +26,7 @@ use windows::{
         },
         System::{
             LibraryLoader::{GetProcAddress, LoadLibraryW},
-            Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE},
+            Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS},
         },
     },
 };
@@ -39,7 +39,7 @@ struct Settings {
     auto_key_fetch: bool,
     addresses: Vec<AddrReplace>,
     classic_wine_fix: bool,
-    md5_search: Vec<u8>,
+    unmd5: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -50,11 +50,7 @@ impl Default for Settings {
             auto_key_fetch: false,
             addresses: vec![AddrReplace::default()],
             classic_wine_fix: false,
-            md5_search: vec![
-                0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
-                0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00,
-                0x00, 0x8b, 0x0d, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x8b, 0xda,
-            ],
+            unmd5: false,
         }
     }
 }
@@ -93,6 +89,7 @@ static HOOK_CRYPT_EXPORT: RwLock<Option<GenericDetour<BCryptExportKey>>> = RwLoc
 static HOOK_GETADDRINFO: RwLock<Option<GenericDetour<GetaddrinfoFn>>> = RwLock::new(None);
 static HOOK_CONNECT: RwLock<Option<GenericDetour<ConnectFn>>> = RwLock::new(None);
 static HOOK_MD5: RwLock<Option<GenericDetour<MD5Fn>>> = RwLock::new(None);
+static MD5_NAMES: RwLock<Option<std::fs::File>> = RwLock::new(None);
 
 static PATH: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 static HANDLES: Mutex<Vec<HMODULE>> = Mutex::new(vec![]);
@@ -135,6 +132,13 @@ fn run_init() -> Result<(), Box<dyn Error>> {
         } else {
             *PATH.write()? = Some(PathBuf::new());
         }
+        if check_ngs() {
+            process_manip::print_msgbox(
+                "This RSA injector is only for the classic version of the game",
+                "Invalid version",
+            );
+            return Ok(());
+        }
         *SETTINGS.write()? = Some(read_settings());
         let settings_lock = SETTINGS.read()?;
         let settings = settings_lock.as_ref().unwrap_window();
@@ -170,6 +174,25 @@ fn run_init() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // GG check
+        // CALL XXX, search by [33 c9 3d 55 07 00 00] offset from beginning: -5
+        let pattern = &[0x33, 0xC9, 0x3D, 0x55, 0x07, 0x00, 0x00];
+        if let Some(ptr) = find_pattern(pattern)? {
+            replace_at(ptr - 5, &[0xB8, 0x55, 0x07, 0x00])?;
+        }
+
+        // GG load
+        // JNZ XXX, search by [48 33 c4 48 89 85 90 1b 00 00 80 39 00] offset from end: 6
+        let pattern = &[
+            0x48, 0x33, 0xC4, 0x48, 0x89, 0x85, 0x90, 0x1b, 0x00, 0x00, 0x80, 0x39, 0x00,
+        ];
+        if let Some(ptr) = find_pattern(pattern)? {
+            replace_at(
+                ptr + pattern.len() + 6,
+                &[0xE9, 0x58, 0x23, 0x00, 0x00, 0x90],
+            )?;
+        }
+
         match get_rsa_key()? {
             Some(x) => *SEGARSAKEYS.write()? = x,
             None => {
@@ -179,8 +202,21 @@ fn run_init() -> Result<(), Box<dyn Error>> {
                 *HOOK_OPEN.write()? = Some(create_hook(orig_import, open_stub)?);
             }
         }
-        if !settings.md5_search.is_empty() {
-            if let Some(ptr) = find_md5(&settings.md5_search)? {
+        // MD5 calculation
+        if settings.unmd5 {
+            let pattern = &[
+                0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
+                0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x81, 0xec, 0xa0, 0x00, 0x00,
+                0x00, 0x8b, 0x0d, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0x8b, 0xda,
+            ];
+            if let Some(ptr) = find_pattern(pattern)? {
+                *MD5_NAMES.write().unwrap_window() = Some(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .open("hashed.txt")
+                        .unwrap_window(),
+                );
                 let orig_import: MD5Fn = mem::transmute(ptr);
                 *HOOK_MD5.write()? = Some(create_hook(orig_import, md5_stub)?);
             }
@@ -189,14 +225,9 @@ fn run_init() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn find_md5(bytes: &[u8]) -> Result<Option<usize>, windows::core::Error> {
+fn find_pattern(bytes: &[u8]) -> Result<Option<usize>, windows::core::Error> {
     let pid = get_process("pso2.exe")?.unwrap();
-    let module = if check_ngs() {
-        return Ok(None);
-    } else {
-        "pso2.exe"
-    };
-    let Some(data) = get_module(pid, module)? else {
+    let Some(data) = get_module(pid, "pso2.exe")? else {
         return Ok(None);
     };
     let data_ptr = data.as_ptr();
@@ -207,35 +238,37 @@ fn find_md5(bytes: &[u8]) -> Result<Option<usize>, windows::core::Error> {
                 continue 'outer;
             }
         }
-        process_manip::print_msgbox("yes", " a");
-        let mut old_flags = PAGE_PROTECTION_FLAGS::default();
-        unsafe {
-            let _ = VirtualProtect(data_ptr.add(0x34) as _, 8, PAGE_READWRITE, &mut old_flags);
-        }
-        data[0x34] = 0x58;
-        data[0x35] = 0xc0;
-        data[0x36] = 0x62;
-        data[0x37] = 0x82;
-        data[0x38] = 0xab;
-        data[0x39] = 0x26;
-        data[0x3a] = 0xa0;
-        data[0x3b] = 0xb1;
-        unsafe {
-            let _ = VirtualProtect(data_ptr.add(0x34) as _, 8, old_flags, std::ptr::null_mut());
-        }
-        process_manip::print_msgbox("yes", " a");
         return Ok(Some(new_ptr as usize));
     }
     Ok(None)
 }
 
+fn replace_at(offset: usize, bytes: &[u8]) -> Result<(), windows::core::Error> {
+    let data_ptr = offset as *mut u8;
+    let data = unsafe { &mut *std::ptr::slice_from_raw_parts_mut::<u8>(data_ptr, bytes.len()) };
+    let mut old_flags = PAGE_PROTECTION_FLAGS::default();
+    unsafe {
+        let _ = VirtualProtect(
+            data_ptr.add(offset) as _,
+            bytes.len(),
+            PAGE_EXECUTE_READWRITE,
+            &mut old_flags,
+        );
+        data[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    Ok(())
+}
+
 extern "system" fn md5_stub(a: u64, input: *const i8) -> *const i8 {
     let hook_lock = HOOK_MD5.read().unwrap_window();
-    let output = hook_lock.as_ref().unwrap().call(a, input);
-    let filename = unsafe { std::ffi::CStr::from_ptr(input) }.to_str().unwrap();
+    let output = hook_lock.as_ref().unwrap_window().call(a, input);
+    let filename = unsafe { std::ffi::CStr::from_ptr(input) }
+        .to_str()
+        .unwrap_window();
     let hash = unsafe { std::ffi::CStr::from_ptr(output) }
         .to_str()
-        .unwrap();
+        .unwrap_window();
     fn move_file(base_dir: &str, filename: &str, hash: &str) {
         let mut orig_filename = std::path::PathBuf::from(base_dir);
         let mut new_filename = orig_filename.clone();
@@ -243,22 +276,17 @@ extern "system" fn md5_stub(a: u64, input: *const i8) -> *const i8 {
         new_filename.push(filename);
         let mut file_path = new_filename.clone();
         file_path.pop();
-        if orig_filename.is_file() {
-            std::fs::create_dir_all(&file_path).unwrap();
-            std::fs::rename(&orig_filename, &new_filename).unwrap();
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open("hashed.txt")
-                .unwrap()
-                .write_all(format!("{hash} - {filename}\n").as_bytes())
-                .unwrap();
+        if !new_filename.exists() && orig_filename.is_file() {
+            std::fs::create_dir_all(&file_path).unwrap_window();
+            std::fs::rename(&orig_filename, &new_filename).unwrap_window();
+            let mut file = MD5_NAMES.write().unwrap_window();
+            let file = file.as_mut().unwrap_window();
+            write!(file, "{hash}:{filename}\n").unwrap_window();
         }
     }
     move_file("data/win32", filename, hash);
     move_file("data/win32_na", filename, hash);
     drop(hook_lock);
-    // output
     input
 }
 
@@ -454,12 +482,7 @@ fn get_rsa_key() -> Result<Option<Vec<Vec<u8>>>, windows::core::Error> {
     let settings_lock = SETTINGS.read().unwrap_window();
     let settings = settings_lock.as_ref().unwrap_window();
     let pid = get_process("pso2.exe")?.unwrap();
-    let module = if check_ngs() {
-        "pso2reboot.dll"
-    } else {
-        "pso2.exe"
-    };
-    let Some(data) = get_module(pid, module)? else {
+    let Some(data) = get_module(pid, "pso2.exe")? else {
         return Ok(None);
     };
     let mut keys: Vec<Vec<u8>> = vec![];
