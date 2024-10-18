@@ -1,10 +1,9 @@
 use windows::{
     core::{PCSTR, PCWSTR},
     Win32::{
-        Foundation::{/* GetLastError, */ BOOL, HINSTANCE, HWND},
+        Foundation::{BOOL, HINSTANCE, HWND},
         System::{
             LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
-            // SystemInformation::GetSystemDirectoryW,
             SystemServices::DLL_PROCESS_ATTACH,
         },
         UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK},
@@ -13,17 +12,6 @@ use windows::{
 #[no_mangle]
 extern "system" fn DllMain(_: HINSTANCE, fdw_reason: u32, _: *mut ()) -> BOOL {
     if fdw_reason == DLL_PROCESS_ATTACH {
-        // let mut win_dir = vec![0; 1024];
-        // let win_dir_len = unsafe { GetSystemDirectoryW(Some(&mut win_dir)) } as usize;
-        // if win_dir_len == 0 {
-        //     print_msgbox(
-        //         &format!("{:?}", unsafe { GetLastError() }),
-        //         "GetSystemDirectory error",
-        //     );
-        //     return false.into();
-        // }
-        // let mut dll_name = String::from_utf16_lossy(&win_dir[0..win_dir_len]);
-        // dll_name.push_str("\\cryptbase.dll");
         let dll_name = "rsa_inject.dll";
         let cryptbase_path: Vec<_> = dll_name.encode_utf16().chain([0]).collect();
         if let Ok(_) = unsafe { GetModuleHandleW(PCWSTR::from_raw(cryptbase_path.as_ptr())) } {
