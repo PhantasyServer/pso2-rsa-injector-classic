@@ -19,7 +19,7 @@ use windows::{
         Foundation::{
             FreeLibrary, FARPROC, HMODULE, NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_SUCCESS,
         },
-        Networking::WinSock::{ADDRINFOA, AF_INET, SOCKADDR, SOCKADDR_IN, SOCKET},
+        Networking::WinSock::ADDRINFOA,
         Security::Cryptography::{
             BCRYPT_ALG_HANDLE, BCRYPT_KEY_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS,
             CRYPT_KEY_FLAGS,
@@ -87,7 +87,6 @@ static HOOK_OPEN: RwLock<Option<GenericDetour<OpenAlgorithmProviderFn>>> = RwLoc
 static HOOK_CRYPT_OPEN: RwLock<Option<GenericDetour<CryptImportKeyFn>>> = RwLock::new(None);
 static HOOK_CRYPT_EXPORT: RwLock<Option<GenericDetour<BCryptExportKey>>> = RwLock::new(None);
 static HOOK_GETADDRINFO: RwLock<Option<GenericDetour<GetaddrinfoFn>>> = RwLock::new(None);
-static HOOK_CONNECT: RwLock<Option<GenericDetour<ConnectFn>>> = RwLock::new(None);
 static HOOK_MD5: RwLock<Option<GenericDetour<MD5Fn>>> = RwLock::new(None);
 static MD5_NAMES: RwLock<Option<std::fs::File>> = RwLock::new(None);
 
@@ -115,8 +114,6 @@ type CryptImportKeyFn =
     extern "system" fn(usize, *const u8, u32, usize, CRYPT_KEY_FLAGS, *mut usize) -> bool;
 
 type GetaddrinfoFn = extern "system" fn(PCSTR, PCSTR, *const ADDRINFOA, *mut *mut ADDRINFOA) -> i32;
-
-type ConnectFn = extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32;
 
 type MD5Fn = extern "system" fn(u64, *const i8) -> *const i8;
 
@@ -167,11 +164,6 @@ fn run_init() -> Result<(), Box<dyn Error>> {
             let orig_getaddrinfo: GetaddrinfoFn =
                 mem::transmute(load_fn("Ws2_32.dll", "getaddrinfo")?.unwrap_window());
             *HOOK_GETADDRINFO.write()? = Some(create_hook(orig_getaddrinfo, getaddrinfo_stub)?);
-            if settings.auto_key_fetch {
-                let orig_connect: ConnectFn =
-                    mem::transmute(load_fn("Ws2_32.dll", "connect")?.unwrap_window());
-                *HOOK_CONNECT.write()? = Some(create_hook(orig_connect, connect_stub)?);
-            }
         }
 
         // GG check
@@ -423,6 +415,15 @@ extern "system" fn getaddrinfo_stub(
         }
     }
     if settings.auto_key_fetch && is_changed {
+        unsafe {
+            HOOK_GETADDRINFO
+                .write()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .disable()
+                .unwrap_window()
+        };
         if let Ok(mut socket) = TcpStream::connect((addr_in.as_str(), 11000)) {
             let mut len = [0u8; 4];
             socket.read_exact(&mut len).unwrap_window();
@@ -431,6 +432,22 @@ extern "system" fn getaddrinfo_stub(
             socket.read_exact(&mut data).unwrap_window();
             let keys = rmp_serde::from_slice::<Vec<Keys>>(&data).unwrap_window();
             *SHIPRSAKEYS.write().unwrap_window() = keys;
+        }
+        unsafe {
+            HOOK_GETADDRINFO
+                .write()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .enable()
+                .unwrap_window()
+        };
+    }
+    if let Ok(addr) = addr_in.parse::<Ipv4Addr>() {
+        let lock = SHIPRSAKEYS.read().unwrap_window();
+        let key = lock.iter().find(|k| k.ip == addr);
+        if let Some(key) = key {
+            *USERRSAKEYS.write().unwrap_window() = key.key.clone();
         }
     }
     let addr_in = CString::new(addr_in).unwrap_window();
@@ -441,22 +458,6 @@ extern "system" fn getaddrinfo_stub(
         phints,
         ppresult,
     )
-}
-
-extern "system" fn connect_stub(s: SOCKET, name: *const SOCKADDR, namelen: i32) -> i32 {
-    let name_deref = unsafe { &*name };
-    if name_deref.sa_family == AF_INET {
-        let name_deref = unsafe { &*(name as *const SOCKADDR_IN) };
-        let ip = unsafe { name_deref.sin_addr.S_un.S_un_b };
-        let ip = Ipv4Addr::new(ip.s_b1, ip.s_b2, ip.s_b3, ip.s_b4);
-        let lock = SHIPRSAKEYS.read().unwrap_window();
-        let key = lock.iter().find(|k| k.ip == ip);
-        if let Some(key) = key {
-            *USERRSAKEYS.write().unwrap_window() = key.key.clone();
-        }
-    }
-    let hook_lock = HOOK_CONNECT.read().unwrap_window();
-    hook_lock.as_ref().unwrap().call(s, name, namelen)
 }
 
 fn load_fn(dll_name: &str, fn_name: &str) -> Result<FARPROC, io::Error> {
