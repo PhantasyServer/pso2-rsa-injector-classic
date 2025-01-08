@@ -1,7 +1,5 @@
 # Filename of the user's public key blob
 user_key = "publicKey.blob"
-# Dump the original keys into files?
-grab_keys = false
 # Enable IP address replacement
 replace_address = true
 # Enable auto key negotiation (requires `replace_address`)

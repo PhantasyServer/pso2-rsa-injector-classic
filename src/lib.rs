@@ -34,23 +34,21 @@ use windows::{
 #[derive(Serialize, Deserialize)]
 struct Settings {
     user_key: String,
-    grab_keys: bool,
     replace_address: bool,
     auto_key_fetch: bool,
-    addresses: Vec<AddrReplace>,
     classic_wine_fix: bool,
     unmd5: bool,
+    addresses: Vec<AddrReplace>,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            grab_keys: true,
             replace_address: false,
             user_key: "publicKey.blob".to_string(),
             auto_key_fetch: false,
-            addresses: vec![AddrReplace::default()],
             classic_wine_fix: false,
             unmd5: false,
+            addresses: vec![AddrReplace::default()],
         }
     }
 }
@@ -90,7 +88,6 @@ static HOOK_GETADDRINFO: RwLock<Option<GenericDetour<GetaddrinfoFn>>> = RwLock::
 static HOOK_MD5: RwLock<Option<GenericDetour<MD5Fn>>> = RwLock::new(None);
 static MD5_NAMES: RwLock<Option<std::fs::File>> = RwLock::new(None);
 
-static PATH: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 static HANDLES: Mutex<Vec<HMODULE>> = Mutex::new(vec![]);
 
 type OpenAlgorithmProviderFn = extern "system" fn(
@@ -124,27 +121,21 @@ extern "system" fn init() {
 
 fn run_init() -> Result<(), Box<dyn Error>> {
     unsafe {
-        if let Some(dir) = get_base_dir("pso2.exe")? {
-            *PATH.write()? = Some(PathBuf::from(dir));
-        } else {
-            *PATH.write()? = Some(PathBuf::new());
-        }
-        if check_ngs() {
+        let path = get_base_dir("pso2.exe")?.unwrap_or_default();
+        if check_ngs(&path) {
             process_manip::print_msgbox(
                 "This RSA injector is only for the classic version of the game",
                 "Invalid version",
             );
             return Ok(());
         }
-        *SETTINGS.write()? = Some(read_settings());
-        let settings_lock = SETTINGS.read()?;
-        let settings = settings_lock.as_ref().unwrap_window();
+        let settings = read_settings(&path);
         if !settings.user_key.is_empty() {
             let key_path = std::path::PathBuf::from(&settings.user_key);
             let key_path = if key_path.is_absolute() {
                 key_path
             } else {
-                PATH.read()?.as_ref().unwrap_window().join(key_path)
+                path.join(key_path)
             };
             if let Ok(mut x) = File::open(&key_path) {
                 x.read_to_end(USERRSAKEYS.write()?.as_mut())?;
@@ -204,8 +195,8 @@ fn run_init() -> Result<(), Box<dyn Error>> {
             if let Some(ptr) = find_pattern(pattern)? {
                 *MD5_NAMES.write().unwrap_window() = Some(
                     std::fs::OpenOptions::new()
-                        .write(true)
                         .create(true)
+                        .append(true)
                         .open("hashed.txt")
                         .unwrap_window(),
                 );
@@ -213,6 +204,7 @@ fn run_init() -> Result<(), Box<dyn Error>> {
                 *HOOK_MD5.write()? = Some(create_hook(orig_import, md5_stub)?);
             }
         }
+        *SETTINGS.write()? = Some(settings);
     }
     Ok(())
 }
@@ -273,7 +265,7 @@ extern "system" fn md5_stub(a: u64, input: *const i8) -> *const i8 {
             std::fs::rename(&orig_filename, &new_filename).unwrap_window();
             let mut file = MD5_NAMES.write().unwrap_window();
             let file = file.as_mut().unwrap_window();
-            write!(file, "{hash}:{filename}\n").unwrap_window();
+            writeln!(file, "{hash}:{filename}").unwrap_window();
         }
     }
     move_file("data/win32", filename, hash);
@@ -282,17 +274,13 @@ extern "system" fn md5_stub(a: u64, input: *const i8) -> *const i8 {
     input
 }
 
-fn read_settings() -> Settings {
-    let path = PATH
-        .read()
-        .unwrap_window()
-        .as_ref()
-        .unwrap_window()
-        .join("config.toml");
+fn read_settings(path: &std::path::Path) -> Settings {
+    let path = path.join("config.toml");
     let mut file = File::options()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&path)
         .unwrap_window();
     let mut toml_string = String::new();
@@ -480,65 +468,42 @@ fn create_hook<T: Function>(orig_fn: T, new_fn: T) -> Result<GenericDetour<T>, B
 }
 
 fn get_rsa_key() -> Result<Option<Vec<Vec<u8>>>, windows::core::Error> {
-    let settings_lock = SETTINGS.read().unwrap_window();
-    let settings = settings_lock.as_ref().unwrap_window();
     let pid = get_process("pso2.exe")?.unwrap();
     let Some(data) = get_module(pid, "pso2.exe")? else {
         return Ok(None);
     };
     let mut keys: Vec<Vec<u8>> = vec![];
-    let mut data_iter = data.iter();
-    let mut key_num = 1;
-    while data_iter.any(|&x| x == RSAHEADER[0]) {
-        let tmp_iter = data_iter.by_ref().take(11);
-        if tmp_iter
-            .zip(RSAHEADER.into_iter().skip(1))
-            .filter(|x| *x.0 == x.1)
-            .count()
-            == 11
-        {
-            //https://learn.microsoft.com/en-us/windows/win32/seccrypto/enhanced-provider-key-blobs
-            let key_len_buff: Vec<u8> = data_iter.by_ref().take(4).copied().collect();
-            let key_len = u32::from_le_bytes(key_len_buff.clone().try_into().unwrap_window());
-            let key: Vec<u8> = RSAHEADER
-                .into_iter()
-                .chain(key_len_buff)
-                .chain(data_iter.by_ref().take((key_len / 8) as usize + 4).copied())
-                .collect();
-            if settings.grab_keys {
-                let path = PATH
-                    .read()
-                    .unwrap_window()
-                    .as_ref()
-                    .unwrap_window()
-                    .join(format!("SEGAKey{key_num}.blob"));
-                File::create(path)
-                    .unwrap_window()
-                    .write_all(&key)
-                    .unwrap_window();
-            }
-            key_num += 1;
-            keys.push(key.into_iter().collect());
+
+    // key structure information
+    // https://learn.microsoft.com/en-us/windows/win32/seccrypto/enhanced-provider-key-blobs
+
+    let header_len = RSAHEADER.len();
+    for i in 0..data.len() - header_len {
+        let tmp_data = &data[i..i + header_len];
+        if tmp_data == RSAHEADER {
+            let data = &data[i..];
+            let key_len = u32::from_le_bytes(data[header_len..header_len + 4].try_into().unwrap());
+            // +4 - key bit length field
+            // +4 - public exponent field
+            let byte_len = key_len as usize / 8 + 4 + 4 + header_len;
+            let data = &data[..byte_len];
+            keys.push(data.to_vec());
         }
     }
 
     Ok(Some(keys))
 }
 
-fn get_base_dir(process_name: &str) -> Result<Option<String>, windows::core::Error> {
+fn get_base_dir(process_name: &str) -> Result<Option<PathBuf>, windows::core::Error> {
     let Some(pid) = get_process(process_name)? else {
         return Ok(None);
     };
     let modules = ModuleSnapshot::new(pid)?;
     for module in modules {
         if module.module_name == process_name {
-            let exe_path = std::path::PathBuf::from(module.module_path);
-            let dir = exe_path
-                .parent()
-                .unwrap_window()
-                .to_string_lossy()
-                .to_string();
-            return Ok(Some(dir));
+            let mut exe_path = std::path::PathBuf::from(module.module_path);
+            exe_path.pop();
+            return Ok(Some(exe_path));
         }
     }
     Ok(None)
@@ -564,11 +529,10 @@ fn get_module(pid: u32, module_name: &str) -> Result<Option<&mut [u8]>, windows:
     Ok(None)
 }
 
-fn check_ngs() -> bool {
-    let mut path = PATH.read().unwrap_window().clone().unwrap_window();
-    match fs::metadata(path.join("pso2_bin")) {
-        Ok(x) if x.is_dir() => path.push("pso2_bin"),
-        Ok(_) | Err(_) => {}
+fn check_ngs(path: &std::path::Path) -> bool {
+    let mut path = match fs::metadata(path.join("pso2_bin")) {
+        Ok(x) if x.is_dir() => path.join("pso2_bin"),
+        Ok(_) | Err(_) => path.to_owned(),
     };
     path.push("pso2reboot.dll");
     if fs::metadata(path).is_ok() {
